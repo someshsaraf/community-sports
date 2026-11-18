@@ -1,0 +1,1012 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Link } from 'react-router-dom';
+import { ref, set, onValue } from '../lib/realtime';
+import { db, liveMatchPath } from '../db';
+import { useRouteSport } from '../hooks/useRouteSport';
+import { CourtWaitingScreen } from '../components/CourtWaitingScreen';
+import { adminPathForSport } from '../data/sports';
+import {
+  FIXTURES,
+  INITIAL_MATCH,
+  BEST_OF_OPTIONS,
+  SCORER_MAX_POINTS_OPTIONS,
+  TENNIS_STAGES,
+  TENNIS_MATCH_TYPES,
+  isBestOf,
+  isMaxPoints
+} from '../data/tournamentData';
+import type { BestOf, MatchState, MaxPoints, Sport, TennisStage, TennisMatchType } from '../data/tournamentData';
+import {
+  formatGameScoresLine,
+  formatGamesWonLabel,
+  hasGameWinner,
+  hasSeriesWinner,
+  normalizeMatchState
+} from '../utils/matchState';
+import {
+  applyDecrementScore,
+  applyScorePoint,
+  applySetMaxPoints,
+  applySetServer,
+  applyStartNextGame,
+  applySwapSides,
+  isGoldenPoint
+} from '../utils/scoring';
+import {
+  applyTennisScorePoint,
+  applyTennisSetServer,
+  applyTennisSwapSides,
+  applyTennisUndoPoint,
+  formatTennisPointLabel
+} from '../utils/tennisScoring';
+import { formatTennisGameLogLine, formatTennisGamesLabel, formatTennisStageLabel } from '../utils/tennisMatchState';
+import {
+  buildCompletedMatch,
+  completedMatchStorageKey,
+  toFirebaseWritable
+} from '../utils/completedMatches';
+import { buildCustomMatchState } from '../utils/customMatch';
+import { buildCustomTennisMatchState } from '../utils/tennisCustomMatch';
+import { ServeRacket } from '../components/ServeRacket';
+import { WinnerCelebration } from '../components/WinnerCelebration';
+import { BetweenMatchAd } from '../components/BetweenMatchAd';
+import { BrandBanner } from '../components/BrandBanner';
+import { SeriesScoreStrip } from '../components/SeriesScoreStrip';
+import { TennisScoreDisplay } from '../components/TennisScoreDisplay';
+import { useMatchAnnouncer } from '../hooks/useMatchAnnouncer';
+import { useBetweenMatchAd } from '../hooks/useBetweenMatchAd';
+import { useVictoryJingle } from '../hooks/useVictoryJingle';
+import { VictoryJinglePlayer } from '../components/VictoryJinglePlayer';
+
+/**
+ * Full-viewport scoreboard for court / audience.
+ * Scores dominate the screen; controls sit in a compact footer strip.
+ */
+export const ScoreControl: React.FC = () => {
+  const routeSport = useRouteSport();
+  const [match, setMatch] = useState<MatchState>(INITIAL_MATCH);
+  /** null until the first live snapshot arrives; then whether a match exists. */
+  const [hasLiveData, setHasLiveData] = useState<boolean | null>(null);
+  const [isSavingResult, setIsSavingResult] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [pendingSaveMatch, setPendingSaveMatch] = useState<MatchState | null>(null);
+  const [resultSaved, setResultSaved] = useState(false);
+  const [showNewMatchForm, setShowNewMatchForm] = useState(false);
+  const [newPlayer1, setNewPlayer1] = useState('');
+  const [newPlayer2, setNewPlayer2] = useState('');
+  const [newMaxPoints, setNewMaxPoints] = useState<MaxPoints>(11);
+  const [newBestOf, setNewBestOf] = useState<BestOf>(1);
+  /** New matches on this scorer are always the route's sport (/scorer/lawn-tennis → tennis). */
+  const newSport: Sport = routeSport;
+  const [newTennisStage, setNewTennisStage] = useState<TennisStage>('qualifier');
+  const [newMatchType, setNewMatchType] = useState<TennisMatchType>('singles');
+  const [newMatchError, setNewMatchError] = useState<string | null>(null);
+  const [celebration, setCelebration] = useState<{
+    winnerName: string;
+    opponentName: string;
+    scoreLabel: string;
+    subtitle: string;
+    seriesOver: boolean;
+    gameScores: { score1: number; score2: number; winner: 1 | 2 }[];
+    seriesLabel: string;
+    matchWinner: 1 | 2 | null;
+  } | null>(null);
+  const promptedKeyRef = useRef<string | null>(null);
+  const autoSavedKeyRef = useRef<string | null>(null);
+  const { audioEnabled, speechSupported, enableAudio, disableAudio } = useMatchAnnouncer(match);
+  const { showAd, currentAd, maybeStartAdAfterCelebration, dismissAd, skipQueuedAd } =
+    useBetweenMatchAd(match);
+  const { embedSrc: victoryJingleSrc, stopJingle } = useVictoryJingle({
+    seriesOver: hasSeriesWinner(match),
+    celebrationVisible: Boolean(celebration?.seriesOver),
+    matchId: match.currentMatchId
+  });
+
+  useEffect(() => {
+    const matchRef = ref(db, liveMatchPath(routeSport));
+    const unsubscribe = onValue(matchRef, (snapshot) => {
+      const data = snapshot.val();
+      setHasLiveData(!!data);
+      if (data) setMatch(normalizeMatchState(data));
+    });
+    return () => unsubscribe();
+  }, [routeSport]);
+
+  /**
+   * Auto-persist when the series ends — do not rely on a Save tap.
+   * Concurrency: one write per match-id+score key via autoSavedKeyRef.
+   */
+  useEffect(() => {
+    if (!hasSeriesWinner(match)) return;
+    const fixtureId =
+      typeof match.currentMatchId === 'string' ? match.currentMatchId.trim() : '';
+    if (!fixtureId) return;
+
+    const key = `${fixtureId}:${match.score1}-${match.score2}:mw${match.matchWinner}:gw${match.gameWinner}:g${match.gameNumber}`;
+    if (autoSavedKeyRef.current === key) return;
+    autoSavedKeyRef.current = key;
+
+    const matchToSave = match;
+    void (async () => {
+      try {
+        const storageKey = completedMatchStorageKey(fixtureId);
+        const fixture = FIXTURES.find((f) => f.id === fixtureId);
+        const completed = buildCompletedMatch(matchToSave, fixture, new Date());
+        await set(
+          ref(db, `completedMatches/${storageKey}`),
+          toFirebaseWritable(completed)
+        );
+        setPendingSaveMatch(matchToSave);
+        setResultSaved(true);
+        setSaveMessage(`Saved ${completed.result}`);
+      } catch (err) {
+        console.error('Auto-save completed match failed:', err);
+        autoSavedKeyRef.current = null;
+        setResultSaved(false);
+        setSaveMessage('Auto-save failed — tap Save Result to retry.');
+      }
+    })();
+  }, [match]);
+
+  // Celebrate when a game ends (BO1 or each game in BO3).
+  useEffect(() => {
+    if (!hasGameWinner(match)) return;
+    const key = `${match.currentMatchId}:g${match.gameNumber}:${match.score1}-${match.score2}:w${match.gameWinner}`;
+    if (promptedKeyRef.current === key) return;
+    promptedKeyRef.current = key;
+    const seriesOver = hasSeriesWinner(match);
+    if (seriesOver) {
+      setPendingSaveMatch(match);
+    } else {
+      setPendingSaveMatch(null);
+    }
+    const side1 = match.player1 || match.teamA || 'Side A';
+    const side2 = match.player2 || match.teamB || 'Side B';
+    const winName = match.gameWinner === 1 ? side1 : side2;
+    const oppName = match.gameWinner === 1 ? side2 : side1;
+    const gamesLine = formatGameScoresLine(match);
+    const subtitle =
+      match.bestOf === 3
+        ? seriesOver
+          ? `Match ${formatGamesWonLabel(match)}${gamesLine ? ` · ${gamesLine}` : ''}`
+          : `Game won · Series ${formatGamesWonLabel(match)}${gamesLine ? ` · ${gamesLine}` : ''}`
+        : '';
+    const rawScores = Array.isArray(match.gameScores) ? match.gameScores : [];
+    setCelebration({
+      winnerName: winName,
+      opponentName: oppName,
+      scoreLabel: `${match.score1 ?? 0}-${match.score2 ?? 0}`,
+      subtitle,
+      seriesOver,
+      gameScores: match.bestOf === 3 ? rawScores : [],
+      seriesLabel: match.bestOf === 3 ? formatGamesWonLabel(match) : '',
+      matchWinner:
+        match.matchWinner === 1 || match.matchWinner === 2
+          ? match.matchWinner
+          : seriesOver && (match.gameWinner === 1 || match.gameWinner === 2)
+            ? match.gameWinner
+            : null
+    });
+  }, [match]);
+
+  // Tennis: celebrate only when the match (set / qualifier race) is decided —
+  // individual games happen too often to celebrate each one.
+  useEffect(() => {
+    if (match.sport !== 'tennis') return;
+    if (!hasSeriesWinner(match)) return;
+    const key = `${match.currentMatchId}:tw${match.matchWinner}:${formatTennisGamesLabel(match)}`;
+    if (promptedKeyRef.current === key) return;
+    promptedKeyRef.current = key;
+    setPendingSaveMatch(match);
+    const side1 = match.player1 || match.teamA || 'Side A';
+    const side2 = match.player2 || match.teamB || 'Side B';
+    const winName = match.matchWinner === 1 ? side1 : side2;
+    const oppName = match.matchWinner === 1 ? side2 : side1;
+    setCelebration({
+      winnerName: winName,
+      opponentName: oppName,
+      scoreLabel: formatTennisGameLogLine(match) || formatTennisGamesLabel(match),
+      subtitle: match.tennis ? `${formatTennisStageLabel(match.tennis.tennisStage)} won` : '',
+      seriesOver: true,
+      gameScores: [],
+      seriesLabel: formatTennisGamesLabel(match),
+      matchWinner: match.matchWinner
+    });
+  }, [match]);
+
+  const updateMatchState = (next: MatchState) => {
+    setMatch(next);
+    set(ref(db, liveMatchPath(routeSport)), next).catch((err) => {
+      console.error('Failed to sync match state to the server:', err);
+    });
+  };
+
+  const isTennis = match.sport === 'tennis';
+
+  const handleScorePoint = (side: 1 | 2) => {
+    if (isTennis) {
+      updateMatchState(applyTennisScorePoint(match, side));
+      return;
+    }
+    let current = match;
+    if (
+      current.bestOf === 3 &&
+      hasGameWinner(current) &&
+      !hasSeriesWinner(current)
+    ) {
+      try {
+        current = applyStartNextGame(current);
+      } catch (err) {
+        setSaveMessage(err instanceof Error ? err.message : 'Could not start next game.');
+        return;
+      }
+    }
+    updateMatchState(applyScorePoint(current, side));
+  };
+
+  const handleDecrement = (side: 1 | 2) => {
+    promptedKeyRef.current = null;
+    autoSavedKeyRef.current = null;
+    setPendingSaveMatch(null);
+    setCelebration(null);
+    setResultSaved(false);
+    setSaveMessage(null);
+    if (isTennis) {
+      updateMatchState(applyTennisUndoPoint(match, side));
+      return;
+    }
+    updateMatchState(applyDecrementScore(match, side));
+  };
+
+  const handleSetServer = (side: 1 | 2) => {
+    if (isTennis) {
+      updateMatchState(applyTennisSetServer(match, side));
+      return;
+    }
+    updateMatchState(applySetServer(match, side));
+  };
+
+  const handleSwapSides = () => {
+    if (isTennis) {
+      updateMatchState(applyTennisSwapSides(match));
+      return;
+    }
+    updateMatchState(applySwapSides(match));
+  };
+
+  const handleSetMaxPoints = (points: 11 | 15 | 21) => {
+    promptedKeyRef.current = null;
+    autoSavedKeyRef.current = null;
+    setCelebration(null);
+    setResultSaved(false);
+    updateMatchState(applySetMaxPoints(match, points));
+  };
+
+  const saveCompletedMatch = async (matchToSave: MatchState) => {
+    if (!hasSeriesWinner(matchToSave)) {
+      setSaveMessage('Finish the match (series) before saving.');
+      return false;
+    }
+    const fixtureId = matchToSave.currentMatchId?.trim();
+    if (!fixtureId) {
+      setSaveMessage('Missing fixture id.');
+      return false;
+    }
+
+    setIsSavingResult(true);
+    setSaveMessage(null);
+    try {
+      const storageKey = completedMatchStorageKey(fixtureId);
+      const fixture = FIXTURES.find((f) => f.id === fixtureId);
+      const completed = buildCompletedMatch(matchToSave, fixture, new Date());
+      await set(
+        ref(db, `completedMatches/${storageKey}`),
+        toFirebaseWritable(completed)
+      );
+      autoSavedKeyRef.current = `${fixtureId}:${matchToSave.score1}-${matchToSave.score2}:mw${matchToSave.matchWinner}:gw${matchToSave.gameWinner}:g${matchToSave.gameNumber}`;
+      setSaveMessage(`Saved ${completed.result}`);
+      setResultSaved(true);
+      return true;
+    } catch (err) {
+      console.error('Failed to save completed match:', err);
+      setSaveMessage(
+        err instanceof Error ? `Failed to save: ${err.message}` : 'Failed to save result.'
+      );
+      return false;
+    } finally {
+      setIsSavingResult(false);
+    }
+  };
+
+  const handleConfirmSave = async () => {
+    await saveCompletedMatch(pendingSaveMatch ?? match);
+  };
+
+  const openNewMatchForm = () => {
+    setNewMatchError(null);
+    setNewPlayer1('');
+    setNewPlayer2('');
+    setNewMaxPoints(isMaxPoints(match.maxPoints) ? match.maxPoints : 11);
+    setNewBestOf(isBestOf(match.bestOf) ? match.bestOf : 1);
+    setNewTennisStage(match.tennis?.tennisStage ?? 'qualifier');
+    setNewMatchType(match.tennis?.matchType ?? 'singles');
+    setShowNewMatchForm(true);
+    setCelebration(null);
+    skipQueuedAd();
+    stopJingle();
+  };
+
+  const handleStartNextGame = () => {
+    try {
+      const next = applyStartNextGame(match);
+      promptedKeyRef.current = null;
+      setCelebration(null);
+      setPendingSaveMatch(null);
+      setSaveMessage(null);
+      updateMatchState(next);
+    } catch (err) {
+      setSaveMessage(err instanceof Error ? err.message : 'Could not start next game.');
+    }
+  };
+
+  /**
+   * Start a fresh custom match from the scorer after a finished game.
+   * Concurrency: single the data store write; Security: names sanitized in buildCustomMatchState.
+   */
+  const handleStartNewMatch = () => {
+    setNewMatchError(null);
+    try {
+      const next =
+        newSport === 'tennis'
+          ? buildCustomTennisMatchState(match, {
+              sideA: newPlayer1,
+              sideB: newPlayer2,
+              tennisStage: newTennisStage,
+              matchType: newMatchType,
+              category: match.category?.trim() || 'Tennis Singles',
+              stage: formatTennisStageLabel(newTennisStage)
+            })
+          : buildCustomMatchState(match, {
+              sideA: newPlayer1,
+              sideB: newPlayer2,
+              maxPoints: newMaxPoints,
+              bestOf: newBestOf,
+              category: match.category?.trim() || 'Exhibition',
+              stage: 'Custom'
+            });
+      promptedKeyRef.current = null;
+      setPendingSaveMatch(null);
+      setCelebration(null);
+      setResultSaved(false);
+      setSaveMessage(null);
+      setShowNewMatchForm(false);
+      stopJingle();
+      updateMatchState(next);
+    } catch (err) {
+      setNewMatchError(err instanceof Error ? err.message : 'Could not start match.');
+    }
+  };
+
+  const hasWinner = hasGameWinner(match);
+  const seriesOver = hasSeriesWinner(match);
+  const scoreButtonsLocked = isTennis
+    ? seriesOver
+    : seriesOver || (hasWinner && match.bestOf !== 3);
+  const score1 = match.score1 ?? 0;
+  const score2 = match.score2 ?? 0;
+  const tennisServer = match.tennis?.server ?? 1;
+  const tennisDisplay1 = isTennis
+    ? formatTennisPointLabel(match.tennis?.points1 ?? 0, match.tennis?.points2 ?? 0, !!match.tennis?.isTiebreak)
+    : String(score1);
+  const tennisDisplay2 = isTennis
+    ? formatTennisPointLabel(match.tennis?.points2 ?? 0, match.tennis?.points1 ?? 0, !!match.tennis?.isTiebreak)
+    : String(score2);
+  const name1 = match.player1 || match.teamA || 'Side A';
+  const name2 = match.player2 || match.teamB || 'Side B';
+  const winnerName = isTennis
+    ? match.matchWinner === 1
+      ? name1
+      : name2
+    : match.gameWinner === 1
+      ? name1
+      : name2;
+  const opponentName = isTennis
+    ? match.matchWinner === 1
+      ? name2
+      : name1
+    : match.gameWinner === 1
+      ? name2
+      : name1;
+  const isBo3 = match.bestOf === 3;
+  const currentServer = isTennis ? tennisServer : match.server;
+
+  const postMatchLinks = (
+    <>
+      <Link
+        to={adminPathForSport(routeSport)}
+        className="rounded-lg border border-amber-500/40 bg-amber-400/15 text-amber-200 text-[10px] sm:text-xs font-bold uppercase tracking-wide px-2.5 py-1.5 hover:bg-amber-400/25"
+      >
+        Admin
+      </Link>
+      <Link
+        to="/sports"
+        className="rounded-lg border border-slate-600 bg-slate-800 text-slate-200 text-[10px] sm:text-xs font-bold uppercase tracking-wide px-2.5 py-1.5 hover:bg-slate-700"
+      >
+        Portal
+      </Link>
+    </>
+  );
+
+  const scorerOptionButtons = (
+    <>
+      {seriesOver && !showNewMatchForm && (
+        <button
+          type="button"
+          onClick={openNewMatchForm}
+          className="text-[10px] sm:text-xs font-black px-2.5 py-1.5 rounded-lg bg-violet-500 text-slate-950 border border-violet-300 active:scale-95"
+        >
+          New Match
+        </button>
+      )}
+      {!seriesOver && hasWinner && isBo3 && !showNewMatchForm && (
+        <button
+          type="button"
+          onClick={handleStartNextGame}
+          className="text-[10px] sm:text-xs font-black px-2.5 py-1.5 rounded-lg bg-amber-400 text-slate-950 border border-amber-300 active:scale-95"
+        >
+          Next Game
+        </button>
+      )}
+      <Link
+        to={adminPathForSport(routeSport)}
+        className="text-[10px] sm:text-xs font-black px-2.5 py-1.5 rounded-lg bg-slate-800 text-amber-300 border border-amber-500/40 active:scale-95"
+      >
+        Admin
+      </Link>
+      {!isTennis && speechSupported && (
+        <button
+          type="button"
+          onClick={() => (audioEnabled ? disableAudio() : enableAudio())}
+          title={
+            audioEnabled
+              ? 'Announcements on — tap to mute'
+              : 'Tap to enable score announcements'
+          }
+          className={`text-[10px] sm:text-xs font-black px-2 py-1 rounded-lg border active:scale-95 ${
+            audioEnabled
+              ? 'bg-amber-400 text-slate-950 border-amber-300'
+              : 'bg-slate-800 text-slate-300 border-slate-700'
+          }`}
+          aria-pressed={audioEnabled}
+        >
+          {audioEnabled ? 'Audio On' : 'Audio'}
+        </button>
+      )}
+      {!isTennis &&
+        SCORER_MAX_POINTS_OPTIONS.map((pts) => (
+          <button
+            key={pts}
+            type="button"
+            onClick={() => handleSetMaxPoints(pts)}
+            title={`Race to ${pts}`}
+            className={`text-[10px] sm:text-xs font-black px-2 py-1 rounded-lg border active:scale-95 ${
+              (match.maxPoints ?? 11) === pts
+                ? 'bg-amber-400 text-slate-950 border-amber-300'
+                : 'bg-slate-800 text-slate-300 border-slate-700'
+            }`}
+          >
+            {pts}
+          </button>
+        ))}
+      <button
+        type="button"
+        onClick={handleSwapSides}
+        className="text-[10px] sm:text-xs font-bold px-2.5 py-1.5 rounded-lg bg-indigo-600/50 text-indigo-50 border border-indigo-400/40 active:scale-95"
+      >
+        ↔ Swap
+      </button>
+    </>
+  );
+
+  if (routeSport !== 'badminton' && hasLiveData !== true) {
+    // Blank while loading, so the "next match" screen doesn't flash before the score.
+    return hasLiveData === false ? <CourtWaitingScreen sport={routeSport} staff /> : <div className="fixed inset-0 bg-slate-950" />;
+  }
+
+  return (
+    <div
+      className="bg-slate-950 text-slate-100 font-sans overflow-hidden flex flex-col"
+      style={{
+        position: 'fixed',
+        inset: 0,
+        width: '100vw',
+        height: '100dvh',
+        maxHeight: '100dvh'
+      }}
+    >
+      {/* Brand banner — centered top */}
+      <div
+        className="shrink-0 flex flex-col items-center gap-1.5 border-b border-slate-800/80 bg-slate-950 px-3"
+        style={{
+          paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
+          paddingBottom: '0.45rem'
+        }}
+      >
+        <BrandBanner size="sm" />
+        {seriesOver && !showNewMatchForm ? (
+          <nav
+            className="flex flex-wrap items-center justify-center gap-1.5"
+            aria-label="After match"
+          >
+            {postMatchLinks}
+          </nav>
+        ) : null}
+      </div>
+
+      {/* Status + controls strip */}
+      <header
+        className="shrink-0 grid grid-cols-[1fr_auto_1fr] items-center gap-2 px-3 border-b border-slate-800 bg-slate-950"
+        style={{
+          paddingTop: '0.35rem',
+          paddingBottom: '0.35rem',
+          minHeight: '2.35rem'
+        }}
+      >
+        <div className="min-w-0 overflow-hidden">
+          <span className="text-[10px] sm:text-xs font-bold text-slate-400 truncate block">
+            {match.category}
+          </span>
+        </div>
+
+        <div className="flex flex-col items-center justify-center gap-1 min-w-0">
+          {isTennis && seriesOver ? (
+            <>
+              <span className="text-sm sm:text-base font-black text-emerald-200 bg-emerald-500/20 border border-emerald-500/50 px-3 py-1.5 rounded-xl text-center leading-snug max-w-[min(92vw,40rem)]">
+                <span className="block whitespace-nowrap truncate">MATCH WIN {winnerName}</span>
+                <span className="block text-white font-black truncate">def. {opponentName}</span>
+                <span className="block text-emerald-300/90 text-[0.85em]">
+                  {formatTennisGameLogLine(match) || formatTennisGamesLabel(match)}
+                </span>
+              </span>
+              {!celebration && !showNewMatchForm && (
+                <button
+                  type="button"
+                  onClick={openNewMatchForm}
+                  className="text-[10px] sm:text-xs font-black px-3 py-1 rounded-full bg-violet-500 text-slate-950 active:scale-95"
+                >
+                  New Match
+                </button>
+              )}
+            </>
+          ) : isTennis ? null : hasWinner ? (
+            <>
+              <span className="text-sm sm:text-base font-black text-emerald-200 bg-emerald-500/20 border border-emerald-500/50 px-3 py-1.5 rounded-xl text-center leading-snug max-w-[min(92vw,40rem)]">
+                <span className="block whitespace-nowrap truncate">
+                  {seriesOver ? 'MATCH' : 'GAME'} WIN {winnerName}
+                </span>
+                <span className="block text-white font-black truncate">
+                  def. {opponentName}
+                </span>
+                <span className="block text-emerald-300/90 text-[0.85em]">
+                  {score1}-{score2}
+                </span>
+              </span>
+              {!celebration && !showNewMatchForm && !seriesOver && isBo3 && (
+                <button
+                  type="button"
+                  onClick={handleStartNextGame}
+                  className="text-[10px] sm:text-xs font-black px-3 py-1 rounded-full bg-amber-400 text-slate-950 active:scale-95"
+                >
+                  Next Game
+                </button>
+              )}
+              {!celebration && !showNewMatchForm && seriesOver && (
+                <button
+                  type="button"
+                  onClick={openNewMatchForm}
+                  className="text-[10px] sm:text-xs font-black px-3 py-1 rounded-full bg-violet-500 text-slate-950 active:scale-95"
+                >
+                  New Match
+                </button>
+              )}
+            </>
+          ) : isGoldenPoint(match) ? (
+            <span className="text-xs font-black text-amber-300 bg-amber-500/20 border border-amber-400/50 px-3 py-1 rounded-full animate-pulse">
+              GOLDEN POINT
+            </span>
+          ) : match.deuceActive ? (
+            <span className="text-xs font-black text-red-400 bg-red-500/20 border border-red-500/50 px-3 py-1 rounded-full animate-pulse">
+              DEUCE
+            </span>
+          ) : isBo3 ? null : (
+            <span className="text-[10px] sm:text-xs font-mono text-slate-500">
+              {match.maxPoints ?? 11} PTS · {match.stage}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-1.5">
+          {!isBo3 && !isTennis ? scorerOptionButtons : null}
+        </div>
+      </header>
+
+      {isTennis ? (
+        <div className="shrink-0 flex items-center gap-2 px-2 py-1 border-b border-slate-800/80 bg-slate-950">
+          <TennisScoreDisplay match={match} size="sm" className="flex-1 min-w-0 py-0" trailing={scorerOptionButtons} />
+        </div>
+      ) : isBo3 ? (
+        <div className="shrink-0 flex items-center gap-2 px-2 py-1 border-b border-slate-800/80 bg-slate-950">
+          <SeriesScoreStrip match={match} size="sm" className="flex-1 min-w-0 py-0" trailing={scorerOptionButtons} />
+        </div>
+      ) : null}
+
+      {/* Score stage — fills all remaining viewport */}
+      <main className="flex-1 min-h-0 grid grid-cols-2 relative">
+        {/* Left */}
+        <section
+          className="flex flex-col min-h-0 min-w-0"
+          style={{
+            background: currentServer === 1
+              ? 'linear-gradient(180deg, rgba(67,56,202,0.35) 0%, rgba(2,6,23,1) 55%)'
+              : 'rgba(2,6,23,1)',
+            borderRight: '1px solid rgba(51,65,85,0.6)'
+          }}
+        >
+          <div className="shrink-0 px-3 pt-3 flex items-center justify-between gap-2">
+            <p className="text-base sm:text-2xl md:text-3xl font-black text-white truncate leading-none">
+              {name1}
+            </p>
+            {currentServer === 1 ? (
+              <span
+                className="shrink-0 p-1.5 rounded-xl bg-emerald-500/25 ring-2 ring-emerald-400/70"
+                title="Serving"
+              >
+                <ServeRacket active size={36} title="Serving" />
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => handleSetServer(1)}
+                title="Set this side as server"
+                className="shrink-0 text-[10px] sm:text-xs font-bold px-2.5 py-1.5 rounded-lg bg-slate-800 text-slate-300 border border-slate-700 active:scale-95"
+              >
+                SET SERVE
+              </button>
+            )}
+          </div>
+
+          <div className="flex-1 min-h-0 flex items-center justify-center">
+            <span
+              className="font-black font-mono tabular-nums leading-none select-none text-indigo-300"
+              style={{ fontSize: isTennis ? 'clamp(3rem, min(22vw, 32dvh), 12rem)' : 'clamp(4.5rem, min(28vw, 42dvh), 16rem)' }}
+            >
+              {isTennis ? tennisDisplay1 : score1}
+            </span>
+          </div>
+        </section>
+
+        {/* Right */}
+        <section
+          className="flex flex-col min-h-0 min-w-0"
+          style={{
+            background: currentServer === 2
+              ? 'linear-gradient(180deg, rgba(190,24,93,0.35) 0%, rgba(2,6,23,1) 55%)'
+              : 'rgba(2,6,23,1)'
+          }}
+        >
+          <div className="shrink-0 px-3 pt-3 flex items-center justify-between gap-2">
+            <p className="text-base sm:text-2xl md:text-3xl font-black text-white truncate leading-none">
+              {name2}
+            </p>
+            {currentServer === 2 ? (
+              <span
+                className="shrink-0 p-1.5 rounded-xl bg-emerald-500/25 ring-2 ring-emerald-400/70"
+                title="Serving"
+              >
+                <ServeRacket active size={36} title="Serving" />
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => handleSetServer(2)}
+                title="Set this side as server"
+                className="shrink-0 text-[10px] sm:text-xs font-bold px-2.5 py-1.5 rounded-lg bg-slate-800 text-slate-300 border border-slate-700 active:scale-95"
+              >
+                SET SERVE
+              </button>
+            )}
+          </div>
+
+          <div className="flex-1 min-h-0 flex items-center justify-center">
+            <span
+              className="font-black font-mono tabular-nums leading-none select-none text-rose-300"
+              style={{ fontSize: isTennis ? 'clamp(3rem, min(22vw, 32dvh), 12rem)' : 'clamp(4.5rem, min(28vw, 42dvh), 16rem)' }}
+            >
+              {isTennis ? tennisDisplay2 : score2}
+            </span>
+          </div>
+        </section>
+
+        <div className="pointer-events-none absolute inset-y-[18%] left-1/2 -translate-x-1/2 flex items-center">
+          <span className="text-slate-600 font-black tracking-[0.3em] text-xs sm:text-base bg-slate-950/70 px-2 py-1 rounded">
+            VS
+          </span>
+        </div>
+      </main>
+
+      {/* Control dock — compact full-width */}
+      <footer
+        className="shrink-0 grid grid-cols-4 gap-2 px-2 sm:px-4 border-t border-slate-800 bg-slate-950"
+        style={{
+          paddingTop: '0.5rem',
+          paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))'
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => handleDecrement(1)}
+          className="rounded-xl bg-slate-800 text-white font-black border border-slate-700 active:scale-95"
+          style={{ fontSize: 'clamp(1.25rem, 3.5vw, 2rem)', padding: '0.85rem 0' }}
+        >
+          −1
+        </button>
+        <button
+          type="button"
+          onClick={() => handleScorePoint(1)}
+          disabled={scoreButtonsLocked}
+          className="rounded-xl text-white font-black active:scale-95 disabled:opacity-35"
+          style={{
+            backgroundColor: '#4f46e5',
+            fontSize: 'clamp(1.25rem, 3.5vw, 2rem)',
+            padding: '0.85rem 0'
+          }}
+        >
+          +1
+        </button>
+        <button
+          type="button"
+          onClick={() => handleDecrement(2)}
+          className="rounded-xl bg-slate-800 text-white font-black border border-slate-700 active:scale-95"
+          style={{ fontSize: 'clamp(1.25rem, 3.5vw, 2rem)', padding: '0.85rem 0' }}
+        >
+          −1
+        </button>
+        <button
+          type="button"
+          onClick={() => handleScorePoint(2)}
+          disabled={scoreButtonsLocked}
+          className="rounded-xl text-white font-black active:scale-95 disabled:opacity-35"
+          style={{
+            backgroundColor: '#e11d48',
+            fontSize: 'clamp(1.25rem, 3.5vw, 2rem)',
+            padding: '0.85rem 0'
+          }}
+        >
+          +1
+        </button>
+      </footer>
+
+      {saveMessage && (
+        <p className="absolute bottom-[4.5rem] left-1/2 -translate-x-1/2 text-[11px] text-slate-300 bg-slate-900/90 border border-slate-700 px-3 py-1 rounded-full z-40 pointer-events-none">
+          {saveMessage}
+        </p>
+      )}
+
+      {celebration && !showAd && (
+        <WinnerCelebration
+          winnerName={celebration.winnerName}
+          opponentName={celebration.opponentName}
+          scoreLabel={celebration.scoreLabel}
+          subtitle={celebration.subtitle}
+          gameScores={celebration.gameScores}
+          seriesLabel={celebration.seriesLabel}
+          matchWinner={celebration.matchWinner}
+          onDismiss={() => {
+            setCelebration(null);
+            maybeStartAdAfterCelebration();
+            if (hasSeriesWinner(match)) {
+              setSaveMessage(
+                resultSaved
+                  ? 'Result saved — see Results / Admin Results.'
+                  : 'Saving result… if it fails, tap Save & Share to retry.'
+              );
+            }
+          }}
+          onSave={hasSeriesWinner(match) ? handleConfirmSave : undefined}
+          isSaving={isSavingResult}
+          alreadySaved={resultSaved}
+          onNextGame={
+            !hasSeriesWinner(match) && match.bestOf === 3 ? handleStartNextGame : undefined
+          }
+          onNewMatch={hasSeriesWinner(match) ? openNewMatchForm : undefined}
+          extraActions={
+            hasSeriesWinner(match) ? (
+              <>
+                <p className="w-full text-center text-[11px] text-slate-400 font-semibold uppercase tracking-wider mb-1">
+                  After the match
+                </p>
+                {postMatchLinks}
+              </>
+            ) : undefined
+          }
+        />
+      )}
+
+      {showAd && currentAd && !showNewMatchForm && (
+        <BetweenMatchAd ad={currentAd} onComplete={dismissAd} allowSkip durationMs={8000} />
+      )}
+
+      {showNewMatchForm && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="new-match-title"
+        >
+          <div className="w-full max-w-md rounded-2xl bg-slate-900 border border-violet-500/40 shadow-2xl p-5 space-y-4">
+            <div className="text-center space-y-1">
+              <h2 id="new-match-title" className="text-xl font-black text-violet-300">
+                Start New Match
+              </h2>
+              <p className="text-xs text-slate-400">Enter players, points, and best-of format</p>
+            </div>
+
+            <label className="block space-y-1.5">
+              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                Player 1 {newSport === 'tennis' ? '/ Team 1' : ''}
+              </span>
+              <input
+                type="text"
+                value={newPlayer1}
+                onChange={(e) => setNewPlayer1(e.target.value)}
+                maxLength={80}
+                autoFocus
+                placeholder="Side A name"
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-3 text-base text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500"
+              />
+            </label>
+
+            <label className="block space-y-1.5">
+              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                Player 2 {newSport === 'tennis' ? '/ Team 2' : ''}
+              </span>
+              <input
+                type="text"
+                value={newPlayer2}
+                onChange={(e) => setNewPlayer2(e.target.value)}
+                maxLength={80}
+                placeholder="Side B name"
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-3 text-base text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500"
+              />
+            </label>
+
+            {newSport === 'tennis' ? (
+              <>
+                <div className="space-y-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                    Stage
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {TENNIS_STAGES.map((stg) => (
+                      <button
+                        key={stg}
+                        type="button"
+                        onClick={() => setNewTennisStage(stg)}
+                        className={`flex-1 text-sm font-black py-3 rounded-xl border active:scale-95 ${
+                          newTennisStage === stg
+                            ? 'bg-amber-400 text-slate-950 border-amber-300'
+                            : 'bg-slate-800 text-slate-300 border-slate-700'
+                        }`}
+                      >
+                        {formatTennisStageLabel(stg)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                    Match type
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {TENNIS_MATCH_TYPES.map((mt) => (
+                      <button
+                        key={mt}
+                        type="button"
+                        onClick={() => setNewMatchType(mt)}
+                        className={`flex-1 text-sm font-black py-3 rounded-xl border active:scale-95 capitalize ${
+                          newMatchType === mt
+                            ? 'bg-violet-400 text-slate-950 border-violet-300'
+                            : 'bg-slate-800 text-slate-300 border-slate-700'
+                        }`}
+                      >
+                        {mt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="space-y-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                    Points
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {SCORER_MAX_POINTS_OPTIONS.map((pts) => (
+                      <button
+                        key={pts}
+                        type="button"
+                        onClick={() => setNewMaxPoints(pts)}
+                        className={`flex-1 text-sm font-black py-3 rounded-xl border active:scale-95 ${
+                          newMaxPoints === pts
+                            ? 'bg-amber-400 text-slate-950 border-amber-300'
+                            : 'bg-slate-800 text-slate-300 border-slate-700'
+                        }`}
+                      >
+                        {pts}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                    Match length
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {BEST_OF_OPTIONS.map((bo) => (
+                      <button
+                        key={bo}
+                        type="button"
+                        onClick={() => setNewBestOf(bo)}
+                        className={`flex-1 text-sm font-black py-3 rounded-xl border active:scale-95 ${
+                          newBestOf === bo
+                            ? 'bg-violet-400 text-slate-950 border-violet-300'
+                            : 'bg-slate-800 text-slate-300 border-slate-700'
+                        }`}
+                      >
+                        Best of {bo}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+
+            {newMatchError && (
+              <p className="text-xs text-red-400 text-center" role="alert">
+                {newMatchError}
+              </p>
+            )}
+
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowNewMatchForm(false);
+                  setNewMatchError(null);
+                }}
+                className="rounded-xl bg-slate-800 text-slate-200 font-bold text-sm py-3.5 border border-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleStartNewMatch}
+                className="rounded-xl bg-violet-500 text-slate-950 font-black text-sm py-3.5 hover:bg-violet-400"
+              >
+                Start Match
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {victoryJingleSrc ? (
+        <VictoryJinglePlayer embedSrc={victoryJingleSrc} onClose={stopJingle} />
+      ) : null}
+    </div>
+  );
+};
+
+export default ScoreControl;

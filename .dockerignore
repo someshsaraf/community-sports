@@ -1,0 +1,13 @@
+node_modules
+dist
+dist-server
+data
+.env
+.git
+kb
+npl
+.cursor
+.claude
+Lawn-Tennis-Photos-2025
+*firebase-adminsdk*.json
+photos-to-upload

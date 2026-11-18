@@ -1,0 +1,330 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #0f172a;
+  --color-ink-soft: #334155;
+  --color-paper: #ffffff;
+  --color-paper-soft: #f8fafc;
+  --color-line: #e2e8f0;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    @apply bg-white text-slate-900 antialiased;
+    font-family: "Source Sans 3", ui-sans-serif, system-ui, sans-serif;
+  }
+}
+
+/* Public portal display headings */
+.npl-portal .portal-display {
+  font-family: "Bebas Neue", "Arial Narrow", Impact, sans-serif;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+}
+
+/* Public portal — plain paper background with a faint dot-grid for texture.
+   Fixed so it reads as ambient page texture rather than a per-page graphic. */
+.npl-portal {
+  position: relative;
+  background:
+    radial-gradient(circle at 1px 1px, rgba(15, 23, 42, 0.035) 1px, transparent 0) 0 0/26px 26px,
+    var(--color-paper);
+  background-attachment: fixed;
+}
+
+/* Signature heading treatment — solid ink, no gradient shimmer on a light bg. */
+.npl-flame-text {
+  color: var(--color-ink);
+}
+
+.npl-glass {
+  background: var(--color-paper);
+  border: 1px solid var(--color-line);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+}
+
+@keyframes npl-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.npl-reveal {
+  animation: npl-reveal 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes npl-glow-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.npl-glow-pulse {
+  animation: npl-glow-pulse 3.5s ease-in-out infinite;
+}
+
+/* Ambient blurred color blobs — dark-theme-only decoration, not used in the
+   light/editorial design. Kept as a no-op rather than stripped from every
+   call site since the divs are otherwise harmless. */
+.npl-blob {
+  display: none;
+}
+
+/* /live CSS immersive / iOS cinema when native Fullscreen API is unavailable. */
+.npl-live-immersive {
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  width: 100dvw !important;
+  height: 100vh !important;
+  height: 100dvh !important;
+  max-width: none !important;
+  max-height: none !important;
+  z-index: 99999 !important;
+  background: #000 !important;
+  overflow: hidden !important;
+}
+
+.npl-live-immersive:fullscreen,
+.npl-live-immersive:-webkit-full-screen {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Prevent rubber-band scroll under the /live cinema shell (iOS Safari/Chrome). */
+html.npl-live-body-lock,
+html.npl-live-body-lock body {
+  overflow: hidden !important;
+  overscroll-behavior: none !important;
+  height: 100% !important;
+  height: 100dvh !important;
+  touch-action: none;
+  background: #000 !important;
+}
+
+/*
+ * iOS Safari only collapses the address/toolbar after a document scroll.
+ * Fixed /live content stays on screen; body is slightly taller so we can nudge scroll.
+ */
+html.npl-live-ios-chrome-collapse {
+  height: auto !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  background: #000 !important;
+}
+
+html.npl-live-ios-chrome-collapse body {
+  min-height: calc(100dvh + 140px) !important;
+  height: auto !important;
+  overflow: visible !important;
+  overscroll-behavior-y: none;
+  background: #000 !important;
+  touch-action: pan-y;
+}
+
+/* NPL brand banner — entrance + continuous attention motion */
+@keyframes npl-brand-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-14px) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes npl-brand-glow {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.35));
+  }
+  50% {
+    filter: drop-shadow(0 0 16px rgba(251, 191, 36, 0.75));
+  }
+}
+
+@keyframes npl-brand-shimmer {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}
+
+@keyframes npl-brand-logo-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+.npl-brand-banner {
+  animation: npl-brand-enter 0.7s cubic-bezier(0.22, 1.2, 0.36, 1) both;
+}
+
+.npl-brand-glow {
+  animation: npl-brand-glow 2.4s ease-in-out infinite;
+}
+
+.npl-brand-logo {
+  animation: npl-brand-logo-bob 2.8s ease-in-out infinite;
+}
+
+.npl-brand-title {
+  background: linear-gradient(
+    90deg,
+    #fbbf24 0%,
+    #fde68a 25%,
+    #ffffff 50%,
+    #fde68a 75%,
+    #fbbf24 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: npl-brand-shimmer 2.8s linear infinite;
+}
+
+/* Full-screen nav overlay — backdrop fade + staggered pill entrance */
+@keyframes npl-nav-overlay-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes npl-nav-pill-enter {
+  from {
+    opacity: 0;
+    transform: translateY(22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.npl-nav-overlay {
+  animation: npl-nav-overlay-fade 0.22s ease-out both;
+}
+
+.npl-nav-pill {
+  animation: npl-nav-pill-enter 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Event tile hover photo strip — slow pan across a few photos while hovered */
+@keyframes npl-tile-pan {
+  from {
+    transform: translateX(0%);
+  }
+  to {
+    transform: translateX(var(--npl-pan-end, 0%));
+  }
+}
+
+.npl-tile-strip {
+  animation: npl-tile-pan var(--npl-pan-duration, 6s) ease-in-out infinite alternate;
+  animation-play-state: paused;
+}
+
+.group:hover .npl-tile-strip {
+  animation-play-state: running;
+}
+
+/* /live match-end celebrate — motion only, no layout change */
+@keyframes npl-live-end-enter {
+  from {
+    opacity: 0.55;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes npl-live-end-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(52, 211, 153, 0.35),
+      0 8px 28px rgba(16, 185, 129, 0.22);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px rgba(110, 231, 183, 0.7),
+      0 10px 36px rgba(52, 211, 153, 0.45);
+  }
+}
+
+@keyframes npl-live-end-score-pop {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.12);
+  }
+  70% {
+    transform: scale(1.04);
+  }
+}
+
+@keyframes npl-live-end-winner-pulse {
+  0%,
+  100% {
+    opacity: 0.92;
+    filter: brightness(1);
+  }
+  50% {
+    opacity: 1;
+    filter: brightness(1.18);
+  }
+}
+
+.npl-live-match-end {
+  animation:
+    npl-live-end-enter 0.55s cubic-bezier(0.22, 1.2, 0.36, 1) both,
+    npl-live-end-glow 1.8s ease-in-out 0.4s infinite;
+}
+
+.npl-live-match-end-score {
+  animation: npl-live-end-score-pop 0.85s cubic-bezier(0.22, 1.2, 0.36, 1) both;
+  transform-origin: center;
+}
+
+.npl-live-match-end-winner {
+  animation: npl-live-end-winner-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .npl-live-match-end,
+  .npl-live-match-end-score,
+  .npl-live-match-end-winner {
+    animation: none !important;
+  }
+}
